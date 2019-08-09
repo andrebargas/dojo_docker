@@ -28,7 +28,10 @@ def insere():
     # status = documentos_col.insert_one(new_mongo_entry)
     return render_template('home.html')
 
-
+@app.route('/busca')
+def busca():
+    docsments = documentos_col.find({})
+    return docsments
 
 if __name__ == "__main__":
     app.run()
