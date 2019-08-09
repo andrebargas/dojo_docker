@@ -1,0 +1,142 @@
+from flask import render_template, send_from_directory
+from flask import Flask, flash, request, redirect, url_for
+from werkzeug.utils import secure_filename
+import base64
+import os
+import requests
+
+app = Flask(__name__)
+app.secret_key = 'some secret key'
+
+ALLOWED_EXTENSIONS = set(['pdf'])
+
+
+@app.route('/')
+def main():
+    return render_template('home.html')
+
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+
+# uploader methods
+
+@app.route('/uploader', methods=['GET'])
+def upload_page():
+    return render_template('uploader.html')
+
+
+@app.route('/uploader', methods=['POST'])
+def upload_file():
+    if request.method == 'POST':
+
+        # check if the post request has the file part
+        if 'file' not in request.files:
+            flash('No file part')
+            return redirect(request.url)
+
+        file = request.files['file']
+
+        if file.filename == '':
+            flash('No file selected for uploading')
+            return redirect(request.url)
+
+        if file and allowed_file(file.filename):
+            b64_document = base64.b64encode(file.read()).decode("utf-8")
+
+            payload = {
+                "document": b64_document
+            }
+
+            result = requests.post("http://triagem:5000/api/pdf", json=payload)
+
+            result_triagem = result.json()
+
+            if result_triagem["type"] == "text":
+                requests.post("http://extractor:5000/api/extract_text", json=result_triagem)
+            else:
+                requests.post("http://extractor:5000/api/extract_img", json=result_triagem)
+
+            flash('File(s) successfully uploaded')
+            return render_template('uploader.html')
+
+
+# search methods
+
+def get_b64_from_mongo(cnpj):
+    payload = {"cnpj": cnpj}
+
+    response = requests.post("http://consultas:5000/api/mongo/get_by_id", json=payload)
+
+    return response.json()
+
+
+def decode_and_save_tmp_pdf(document_b64, document_id):
+    document = base64.b64decode(document_b64)
+    
+    with open("tmp/{}.pdf".format(document_id), "wb") as f:
+        f.write(document)
+
+
+@app.route('/search', methods=['GET'])
+def search_page():
+    return render_template("search.html")
+
+
+@app.route('/search', methods=['POST'])
+def search_docs():
+    search_type = request.values["type"]
+    search_body = request.values["busca"]
+
+    search_body = str.replace(search_body, "/", " ")
+    search_body = str.replace(search_body, "-", " ")
+
+    docs_ids = []
+
+    if search_type == "cnpj":
+        payload = {
+            "cnpj": search_body
+        }
+        response = requests.post("http://consultas:5000/api/solr/get_by_id", json=payload)
+        response_data = response.json()
+        try:
+            search_result = get_b64_from_mongo(response_data['cnpj'][0])[0]
+            document_b64 = search_result["b64_document"]
+            document_id = search_result["cnpj"].split("/")[0]
+            decode_and_save_tmp_pdf(document_b64, document_id)
+            new_element = {**{"doc_id": document_id}, **response_data}
+            docs_ids.append(new_element)
+        except:
+            return render_template("search.html")
+
+    elif search_type == "termo":
+        payload = {
+            "term": search_body
+        }
+        response = requests.post("http://consultas:5000/api/solr/get_by_term", json=payload)
+        response_data = response.json()
+
+        for element in response_data:
+            try:
+                search_result = get_b64_from_mongo(element["cnpj"][0])
+                document_b64 = search_result[0]["b64_document"]
+                document_id = search_result[0]["cnpj"].split("/")[0]
+                decode_and_save_tmp_pdf(document_b64, document_id)
+                new_element = {**{"doc_id":document_id}, **element}
+                new_element = {**new_element, **element}
+
+                docs_ids.append(new_element)
+            except:
+                continue
+    return render_template("search.html", docs_ids=docs_ids)
+
+
+@app.route('/download/<id>', methods=['GET', 'POST'])
+def download_document(id=None):
+
+    return send_from_directory(directory="./tmp", filename="{}.pdf".format(id))
+
+
+if __name__ == "__main__":
+    app.run()
